@@ -5,6 +5,7 @@ import {QueryExpressionMap} from "./QueryExpressionMap";
 import {SelectQueryBuilder} from "./SelectQueryBuilder";
 import {UpdateQueryBuilder} from "./UpdateQueryBuilder";
 import {DeleteQueryBuilder} from "./DeleteQueryBuilder";
+import {SoftDeleteQueryBuilder} from "./SoftDeleteQueryBuilder";
 import {InsertQueryBuilder} from "./InsertQueryBuilder";
 import {RelationQueryBuilder} from "./RelationQueryBuilder";
 import {ObjectType} from "../common/ObjectType";
@@ -19,6 +20,7 @@ import {OracleDriver} from "../driver/oracle/OracleDriver";
 import {EntitySchema} from "../";
 import {FindOperator} from "../find-options/FindOperator";
 import {In} from "../find-options/operator/In";
+import {EntityColumnNotFound} from "../error/EntityColumnNotFound";
 
 // todo: completely cover query builder with tests
 // todo: entityOrProperty can be target name. implement proper behaviour if it is.
@@ -144,7 +146,7 @@ export abstract class QueryBuilder<Entity> {
      */
     select(selection?: string|string[], selectionAliasName?: string): SelectQueryBuilder<Entity> {
         this.expressionMap.queryType = "select";
-        if (selection instanceof Array) {
+        if (Array.isArray(selection)) {
             this.expressionMap.selects = selection.map(selection => ({ selection: selection }));
         } else if (selection) {
             this.expressionMap.selects = [{ selection: selection, aliasName: selectionAliasName }];
@@ -239,6 +241,28 @@ export abstract class QueryBuilder<Entity> {
         return new DeleteQueryBuilderCls(this);
     }
 
+    softDelete(): SoftDeleteQueryBuilder<any> {
+        this.expressionMap.queryType = "soft-delete";
+
+        // loading it dynamically because of circular issue
+        const SoftDeleteQueryBuilderCls = require("./SoftDeleteQueryBuilder").SoftDeleteQueryBuilder;
+        if (this instanceof SoftDeleteQueryBuilderCls)
+            return this as any;
+
+        return new SoftDeleteQueryBuilderCls(this);
+    }
+
+    restore(): SoftDeleteQueryBuilder<any> {
+        this.expressionMap.queryType = "restore";
+
+        // loading it dynamically because of circular issue
+        const SoftDeleteQueryBuilderCls = require("./SoftDeleteQueryBuilder").SoftDeleteQueryBuilder;
+        if (this instanceof SoftDeleteQueryBuilderCls)
+            return this as any;
+
+        return new SoftDeleteQueryBuilderCls(this);
+    }
+
     /**
      * Sets entity's relation with which this query builder gonna work.
      */
@@ -297,7 +321,7 @@ export abstract class QueryBuilder<Entity> {
      */
     hasRelation<T>(target: ObjectType<T>|string, relation: string|string[]): boolean {
         const entityMetadata = this.connection.getMetadata(target);
-        const relations = relation instanceof Array ? relation : [relation];
+        const relations = Array.isArray(relation) ? relation : [relation];
         return relations.every(relation => {
             return !!entityMetadata.findRelationWithPropertyPath(relation);
         });
@@ -574,27 +598,45 @@ export abstract class QueryBuilder<Entity> {
      * Creates "WHERE" expression.
      */
     protected createWhereExpression() {
-        const conditions = this.createWhereExpressionString();
+        const conditionsArray = [];
+
+        const whereExpression = this.createWhereExpressionString();
+        whereExpression.trim() && conditionsArray.push(this.createWhereExpressionString());
 
         if (this.expressionMap.mainAlias!.hasMetadata) {
             const metadata = this.expressionMap.mainAlias!.metadata;
+            // Adds the global condition of "non-deleted" for the entity with delete date columns in select query.
+            if (this.expressionMap.queryType === "select" && !this.expressionMap.withDeleted && metadata.deleteDateColumn) {
+                const column = this.expressionMap.aliasNamePrefixingEnabled
+                    ? this.expressionMap.mainAlias!.name + "." + metadata.deleteDateColumn.propertyName
+                    : metadata.deleteDateColumn.propertyName;
+
+                const condition = `${this.replacePropertyNames(column)} IS NULL`;
+                conditionsArray.push(condition);
+            }
+
             if (metadata.discriminatorColumn && metadata.parentEntityMetadata) {
                 const column = this.expressionMap.aliasNamePrefixingEnabled
                     ? this.expressionMap.mainAlias!.name + "." + metadata.discriminatorColumn.databaseName
                     : metadata.discriminatorColumn.databaseName;
 
                 const condition = `${this.replacePropertyNames(column)} IN (:...discriminatorColumnValues)`;
-                return ` WHERE ${ conditions.length ? "(" + conditions + ") AND" : "" } ${condition}`;
+                conditionsArray.push(condition);
             }
         }
 
-        if (!conditions.length) // TODO copy in to discriminator condition
-            return this.expressionMap.extraAppendedAndWhereCondition ? " WHERE " + this.replacePropertyNames(this.expressionMap.extraAppendedAndWhereCondition) : "";
+        if (this.expressionMap.extraAppendedAndWhereCondition) {
+            const condition = this.replacePropertyNames(this.expressionMap.extraAppendedAndWhereCondition);
+            conditionsArray.push(condition);
+        }
 
-        if (this.expressionMap.extraAppendedAndWhereCondition)
-            return " WHERE (" + conditions + ") AND " + this.replacePropertyNames(this.expressionMap.extraAppendedAndWhereCondition);
-
-        return " WHERE " + conditions;
+        if (!conditionsArray.length) {
+            return " ";
+        } else if (conditionsArray.length === 1) {
+            return ` WHERE ${conditionsArray[0]}`;
+        } else {
+            return ` WHERE ( ${conditionsArray.join(" ) AND ( ")} )`;
+        }
     }
 
     /**
@@ -618,7 +660,7 @@ export abstract class QueryBuilder<Entity> {
             let columnsExpression = columns.map(column => {
                 const name = this.escape(column.databaseName);
                 if (driver instanceof SqlServerDriver) {
-                    if (this.expressionMap.queryType === "insert" || this.expressionMap.queryType === "update") {
+                    if (this.expressionMap.queryType === "insert" || this.expressionMap.queryType === "update" || this.expressionMap.queryType === "soft-delete" || this.expressionMap.queryType === "restore") {
                         return "INSERTED." + name;
                     } else {
                         return this.escape(this.getMainTableName()) + "." + name;
@@ -635,6 +677,13 @@ export abstract class QueryBuilder<Entity> {
                     return this.connection.driver.createParameter(parameterName, Object.keys(this.expressionMap.nativeParameters).length);
                 }).join(", ");
             }
+
+            if (driver instanceof SqlServerDriver) {
+                if (this.expressionMap.queryType === "insert" || this.expressionMap.queryType === "update") {
+                    columnsExpression += " INTO @OutputTable";
+                }
+            }
+
             return columnsExpression;
 
         } else if (typeof this.expressionMap.returning === "string") {
@@ -650,7 +699,7 @@ export abstract class QueryBuilder<Entity> {
      */
     protected getReturningColumns(): ColumnMetadata[] {
         const columns: ColumnMetadata[] = [];
-        if (this.expressionMap.returning instanceof Array) {
+        if (Array.isArray(this.expressionMap.returning)) {
             (this.expressionMap.returning as string[]).forEach(columnName => {
                 if (this.expressionMap.mainAlias!.hasMetadata) {
                     columns.push(...this.expressionMap.mainAlias!.metadata.findColumnsWithPropertyPath(columnName));
@@ -738,7 +787,7 @@ export abstract class QueryBuilder<Entity> {
             return where(this);
 
         } else if (where instanceof Object) {
-            const wheres: ObjectLiteral[] = where instanceof Array ? where : [where];
+            const wheres: ObjectLiteral[] = Array.isArray(where) ? where : [where];
             let andConditions: string[];
             let parameterIndex = Object.keys(this.expressionMap.nativeParameters).length;
 
@@ -748,6 +797,11 @@ export abstract class QueryBuilder<Entity> {
 
                     return propertyPaths.map((propertyPath, propertyIndex) => {
                         const columns = this.expressionMap.mainAlias!.metadata.findColumnsWithPropertyPath(propertyPath);
+
+                        if (!columns.length) {
+                            throw new EntityColumnNotFound(propertyPath);
+                        }
+
                         return columns.map((column, columnIndex) => {
 
                             const aliasPath = this.expressionMap.aliasNamePrefixingEnabled ? `${this.alias}.${propertyPath}` : column.propertyPath;

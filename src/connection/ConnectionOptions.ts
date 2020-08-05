@@ -12,6 +12,9 @@ import {NativescriptConnectionOptions} from "../driver/nativescript/Nativescript
 import {ExpoConnectionOptions} from "../driver/expo/ExpoConnectionOptions";
 import { FirebirdConnectionOptions } from "../driver/firebird/FirebirdConnectionOptions";
 import {AuroraDataApiConnectionOptions} from "../driver/aurora-data-api/AuroraDataApiConnectionOptions";
+import {SapConnectionOptions} from "../driver/sap/SapConnectionOptions";
+import {AuroraDataApiPostgresConnectionOptions} from "../driver/aurora-data-api-pg/AuroraDataApiPostgresConnectionOptions";
+import {BetterSqlite3ConnectionOptions} from "../driver/better-sqlite3/BetterSqlite3ConnectionOptions";
 
 /**
  * ConnectionOptions is an interface with settings and options for specific connection.
@@ -24,6 +27,7 @@ export type ConnectionOptions =
     CockroachConnectionOptions|
     SqliteConnectionOptions|
     SqlServerConnectionOptions|
+    SapConnectionOptions|
     OracleConnectionOptions|
     CordovaConnectionOptions|
     NativescriptConnectionOptions|
@@ -32,4 +36,6 @@ export type ConnectionOptions =
     MongoConnectionOptions|
     AuroraDataApiConnectionOptions|
     FirebirdConnectionOptions|
-    ExpoConnectionOptions;
+    ExpoConnectionOptions|
+    AuroraDataApiPostgresConnectionOptions|
+    BetterSqlite3ConnectionOptions;

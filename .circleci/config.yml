@@ -1,13 +1,93 @@
-# Javascript Node CircleCI 2.0 configuration file
-# Check https://circleci.com/docs/2.0/language-javascript/ for more details
-version: 2
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.1.1
+
+commands:
+  create-typeorm-config:
+    parameters:
+      databases:
+        type: string
+        default: ""
+    steps:
+      - when:
+          condition:
+            equal: [ << parameters.databases >>, "" ]
+          steps:
+            - run:
+                name: "Enabling Databases in ORM config"
+                command: cp ormconfig.circleci-common.json ./ormconfig.json
+      - unless:
+          condition:
+            equal: [ << parameters.databases >>, "" ]
+          steps:
+            - run:
+                name: "Enabling Databases in ORM config"
+                command: >
+                  cat ormconfig.circleci-common.json \
+                    | jq 'map(.skip = if (.name | IN($ARGS.positional[])) then false else true end)' --args << parameters.databases >> \
+                    > ormconfig.json
+      - run:
+          name: Check ORMConfig
+          command: cat ormconfig.json
+
+  install-packages:
+    parameters:
+      cache-key:
+        type: string
+        default: ""
+    steps:
+      - restore_cache:
+          name: Restore node_modules cache
+          key: node_modules-<< parameters.cache-key >>-{{ checksum "package-lock.json" }}
+      - run:
+          name: Install Node Packages
+          command: |
+            if [ ! -d node_modules ]; then
+              npm ci
+            fi
+      - save_cache:
+          name: Save node_modules cache
+          key: node_modules-{{ checksum "package-lock.json" }}
+          paths:
+            - node_modules
+
 jobs:
+  lint:
+    working_directory: ~/typeorm
+    docker:
+      - image: circleci/node:12
+    steps:
+      - checkout
+      - install-packages:
+          cache-key: node12
+      - run: npm run lint
+
   build:
     working_directory: ~/typeorm
     docker:
-      # specify pre-built docker images
-      # documented at https://circleci.com/docs/2.0/circleci-images/
-      - image: circleci/node:10.15.0
+      - image: circleci/node:12
+    steps:
+      - checkout
+      - install-packages:
+          cache-key: node12
+      - run: npm run compile
+      - persist_to_workspace:
+          root: ~/typeorm
+          paths:
+            - build/
+
+  test:
+    parameters:
+      databases:
+        type: string
+        default: ""
+      node-version:
+        type: string
+        default: "10"
+    working_directory: ~/typeorm
+    docker:
+      - image: circleci/node:<< parameters.node-version >>
       - image: mysql:5.7.24
         environment:
           MYSQL_ROOT_PASSWORD: "admin"
@@ -18,39 +98,58 @@ jobs:
           MYSQL_ROOT_PASSWORD: "admin"
           MYSQL_DATABASE: "test"
       - image: circleci/postgres:9.6.11-postgis
+        name: postgres
         environment:
           POSTGRES_USER: "test"
           POSTGRES_PASSWORD: "test"
           POSTGRES_DB: "test"
+      - image: cockroachdb/cockroach:latest
+        name: cockroachdb
+        command: start --insecure
       - image: circleci/mongo:3.4.18
-      # - image: mcr.microsoft.com/mssql/server:2017-GA-ubuntu
-      #   environment:
-      #     SA_PASSWORD: "Admin12345"
-      #     ACCEPT_EULA: "Y"
-      # - image: cockroachdb/cockroach-unstable:latest
-      #   command: start --insecure
+        name: mongodb
+      - image: mcr.microsoft.com/mssql/server:2017-latest
+        name: mssql
+        environment:
+          SA_PASSWORD: "Admin123"
+          ACCEPT_EULA: "Y"
 
     steps:
       - checkout
-      - run: sudo npm install -g npm@latest
-      - run: cp ormconfig.circleci.json ormconfig.json
-
+      - attach_workspace:
+          at: ~/typeorm
+      - create-typeorm-config:
+          databases: << parameters.databases >>
       # Download and cache dependencies
-      - restore_cache:
-          keys:
-          - v1-dependencies-{{ checksum "package.json" }}
-          # fallback to using the latest cache if no exact match is found
-          - v1-dependencies-
+      - install-packages:
+          cache-key: node<< parameters.node-version >>
+      - run: npx nyc npm run test-fast
+      - store_artifacts:
+          path: coverage
+      - codecov/upload
 
-      - run: npm install
-
-      - save_cache:
-          paths:
-            - node_modules
-          key: v1-dependencies-{{ checksum "package.json" }}
-
-      # - run: docker-compose up -d
-
-      # run tests
-      - run: npm run lint
-      - run: npm test
+workflows:
+  version: 2
+  test:
+    jobs:
+      - lint
+      - build
+      - test:
+          name: test (mysql mariadb sqlite better-sqlite3 postgres sqljs mssql mongodb) - Node v<< matrix.node-version >>
+          requires:
+            - lint
+            - build
+          matrix:
+            databases: "mysql mariadb sqlite better-sqlite3 postgres sqljs mssql mongodb"
+            parameters:
+              node-version:
+                - "10"
+                - "12"
+                - "13"
+      - test:
+          name: test (cockroachdb) - Node v12
+          requires:
+            - lint
+            - build
+          databases: "cockroachdb"
+          node-version: "12"

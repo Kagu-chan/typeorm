@@ -1371,7 +1371,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         }).join(" OR ");
 
         const constraintsSql = `SELECT "ns"."nspname" AS "table_schema", "t"."relname" AS "table_name", "cnst"."conname" AS "constraint_name", ` +
-            `CASE "cnst"."contype" WHEN 'x' THEN pg_get_constraintdef("cnst"."oid", true) ELSE "cnst"."consrc" END AS "expression", ` +
+            `pg_get_constraintdef("cnst"."oid") AS "expression", ` +
             `CASE "cnst"."contype" WHEN 'p' THEN 'PRIMARY' WHEN 'u' THEN 'UNIQUE' WHEN 'c' THEN 'CHECK' WHEN 'x' THEN 'EXCLUDE' END AS "constraint_type", "a"."attname" AS "column_name" ` +
             `FROM "pg_constraint" "cnst" ` +
             `INNER JOIN "pg_class" "t" ON "t"."oid" = "cnst"."conrelid" ` +
@@ -1424,7 +1424,6 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             this.query(indicesSql),
             this.query(foreignKeysSql),
         ]);
-
         // if tables were not found in the db, no need to proceed
         if (!dbTables.length)
             return [];
@@ -1433,9 +1432,10 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         return Promise.all(dbTables.map(async dbTable => {
             const table = new Table();
 
+            const getSchemaFromKey = (dbObject: any, key: string) => dbObject[key] === currentSchema && !this.driver.options.schema ? undefined : dbObject[key];
             // We do not need to join schema name, when database is by default.
             // In this case we need local variable `tableFullName` for below comparision.
-            const schema = dbTable["table_schema"] === currentSchema && !this.driver.options.schema ? undefined : dbTable["table_schema"];
+            const schema = getSchemaFromKey(dbTable, "table_schema");
             table.name = this.driver.buildTableName(dbTable["table_name"], schema);
             const tableFullName = this.driver.buildTableName(dbTable["table_name"], dbTable["table_schema"]);
 
@@ -1501,7 +1501,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                           "type"
                         FROM "geometry_columns"
                       ) AS _
-                      WHERE ${tablesCondition} AND "column_name" = '${tableColumn.name}'`;
+                      WHERE (${tablesCondition}) AND "column_name" = '${tableColumn.name}' AND "table_name" = '${dbTable["table_name"]}'`;
 
                         const results: ObjectLiteral[] = await this.query(geometryColumnSql);
                         tableColumn.spatialFeatureType = results[0].type;
@@ -1518,7 +1518,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                           "type"
                         FROM "geography_columns"
                       ) AS _
-                      WHERE ${tablesCondition} AND "column_name" = '${tableColumn.name}'`;
+                      WHERE (${tablesCondition}) AND "column_name" = '${tableColumn.name}' AND "table_name" = '${dbTable["table_name"]}'`;
 
                         const results: ObjectLiteral[] = await this.query(geographyColumnSql);
                         tableColumn.spatialFeatureType = results[0].type;
@@ -1586,7 +1586,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                 return new TableCheck({
                     name: constraint["constraint_name"],
                     columnNames: checks.map(c => c["column_name"]),
-                    expression: constraint["expression"] // column names are not escaped, may cause problems
+                    expression: constraint["expression"].replace(/^\s*CHECK\s*\((.*)\)\s*$/i, "$1")
                 });
             });
 
@@ -1612,7 +1612,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                 const foreignKeys = dbForeignKeys.filter(dbFk => dbFk["constraint_name"] === dbForeignKey["constraint_name"]);
 
                 // if referenced table located in currently used schema, we don't need to concat schema name to table name.
-                const schema = dbForeignKey["referenced_table_schema"] === currentSchema ? undefined : dbTable["referenced_table_schema"];
+                const schema = getSchemaFromKey(dbForeignKey, "referenced_table_schema");
                 const referencedTableName = this.driver.buildTableName(dbForeignKey["referenced_table_name"], schema);
 
                 return new TableForeignKey({
@@ -1739,10 +1739,13 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
     }
 
     protected createViewSql(view: View): Query {
+        const materializedClause = view.materialized ? "MATERIALIZED " : "";
+        const viewName = this.escapePath(view);
+
         if (typeof view.expression === "string") {
-            return new Query(`CREATE VIEW ${this.escapePath(view)} AS ${view.expression}`);
+            return new Query(`CREATE ${materializedClause}VIEW ${viewName} AS ${view.expression}`);
         } else {
-            return new Query(`CREATE VIEW ${this.escapePath(view)} AS ${view.expression(this.connection).getQuery()}`);
+            return new Query(`CREATE ${materializedClause}VIEW ${viewName} AS ${view.expression(this.connection).getQuery()}`);
         }
     }
 
@@ -1986,6 +1989,15 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
      * Builds ENUM type name from given table and column.
      */
     protected buildEnumName(table: Table, columnOrName: TableColumn|string, withSchema: boolean = true, disableEscape?: boolean, toOld?: boolean): string {
+        /**
+         * If enumName is specified in column options then use it instead
+         */
+        if (columnOrName instanceof TableColumn && columnOrName.enumName) {
+            let enumName = columnOrName.enumName;
+            if (toOld)
+                enumName = enumName + "_old";
+            return disableEscape ? enumName : `"${enumName}"`;
+        }
         const columnName = columnOrName instanceof TableColumn ? columnOrName.name : columnOrName;
         const schema = table.name.indexOf(".") === -1 ? this.driver.options.schema : table.name.split(".")[0];
         const tableName = table.name.indexOf(".") === -1 ? table.name : table.name.split(".")[1];
