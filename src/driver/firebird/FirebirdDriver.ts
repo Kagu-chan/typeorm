@@ -77,6 +77,8 @@ export class FirebirdDriver implements Driver {
         updateDate: "timestamp",
         updateDatePrecision: 6,
         updateDateDefault: "NOW",
+        deleteDate: "timestamp",
+        deleteDateNullable: true,
         version: "int",
         treeLevel: "int",
         migrationId: "int",
